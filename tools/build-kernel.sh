@@ -21,13 +21,17 @@ make_args=(-C "$src" O="$BUILD/kernel" -j"$JOBS"
 	HOSTCFLAGS="-I$hostelf/usr/include" HOSTLDFLAGS="-L$hostelf/usr/lib/x86_64-linux-gnu -Wl,-rpath,$hostelf/usr/lib/x86_64-linux-gnu")
 image=arch/x86/boot/bzImage defconfig=x86_64_defconfig
 if [[ $ARCH == arm64 ]]; then
-	make_args+=(ARCH=arm64 CROSS_COMPILE=${CROSS_COMPILE:-aarch64-linux-gnu-})
+	# the air/OS build server's (Ubuntu's) aarch64 cross compiler
+	make_args+=(ARCH=arm64 CROSS_COMPILE=${CROSS_COMPILE:-/data1/airos/toolchain/cubie-host/bin/aarch64-linux-gnu-})
 	image=arch/arm64/boot/Image defconfig=defconfig
 fi
 mkdir -p "$BUILD/kernel"
 make "${make_args[@]}" "$defconfig" >/dev/null
-(cd "$BUILD/kernel" && "$src/scripts/kconfig/merge_config.sh" -m .config \
-	"$src/kernel/configs/kvm_guest.config" "$ROOT/kernel/linuxvm.config" >/dev/null)
+fragments=("$src/kernel/configs/kvm_guest.config" "$ROOT/kernel/linuxvm.config")
+# arm64's defconfig builds in every SoC family's drivers: QEMU's virt
+# machine needs none of them, and under emulation each probe costs boot time
+[[ $ARCH != arm64 ]] || fragments+=("$ROOT/kernel/linuxvm-arm64.config")
+(cd "$BUILD/kernel" && "$src/scripts/kconfig/merge_config.sh" -m .config "${fragments[@]}" >/dev/null)
 make "${make_args[@]}" olddefconfig >/dev/null
 make "${make_args[@]}" "$(basename "$image")" >/dev/null
 cp "$BUILD/kernel/$image" "$BUILD/vmlinuz"
