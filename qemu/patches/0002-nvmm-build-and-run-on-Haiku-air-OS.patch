@@ -1,0 +1,115 @@
+From 0f761b346a0271508f80d73ee210097f5f3503ff Mon Sep 17 00:00:00 2001
+From: Justin Gasper <jmgasper@gmail.com>
+Date: Fri, 30 Oct 2026 17:39:54 +1100
+Subject: [PATCH 2/3] nvmm: build and run on Haiku (air/OS)
+
+Haiku has NVMM (src/add-ons/kernel/drivers/nvmm and libnvmm): look for
+libnvmm there as on NetBSD, build without -no-pie (Haiku binaries are
+position independent), and return -EPERM where NetBSD has EPROGMISMATCH.
+nvmm_init_vcpu set vcpu_dirty on the AccelCPUState, which moved to
+CPUState.
+
+A reset sets every VCPU's TSC to zero, one VCPU after the other, which
+left them far apart (on Haiku's NVMM a write of the value it last reported
+is ignored, so whether a VCPU's write took depended on whether its state
+had been read first). Linux then marks the TSC unstable and reads the
+HPET, a VM exit per clock read. Keep the host's TSC, synchronized across
+its CPUs, on every VCPU: write back what NVMM reported when the TSC is
+the reset value.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ meson.build                 |  4 ++--
+ target/i386/nvmm/nvmm-all.c | 23 +++++++++++++++++++----
+ 2 files changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/meson.build b/meson.build
+index d9293294d..64796c9f9 100644
+--- a/meson.build
++++ b/meson.build
+@@ -477,7 +477,7 @@ endif
+ #
+ # Emscripten doesn't support -no-pie but meson can't catch the compiler
+ # warning. So explicitly omit the flag for Emscripten.
+-if not get_option('b_pie') and host_os != 'emscripten'
++if not get_option('b_pie') and host_os not in ['emscripten', 'haiku']
+   qemu_common_flags += cc.get_supported_arguments('-fno-pie', '-no-pie')
+ endif
+ 
+@@ -909,7 +909,7 @@ if get_option('hvf').allowed()
+ endif
+ 
+ nvmm = not_found
+-if host_os == 'netbsd'
++if host_os in ['netbsd', 'haiku']
+   nvmm = cc.find_library('nvmm', required: get_option('nvmm'))
+   if nvmm.found()
+     accelerators += 'CONFIG_NVMM'
+diff --git a/target/i386/nvmm/nvmm-all.c b/target/i386/nvmm/nvmm-all.c
+index b9bd9ed98..1e28dd91e 100644
+--- a/target/i386/nvmm/nvmm-all.c
++++ b/target/i386/nvmm/nvmm-all.c
+@@ -41,6 +41,9 @@ struct AccelCPUState {
+ 
+     /* The guest is in an interrupt shadow (POP SS, etc). */
+     bool int_shadow;
++
++    /* The TSC value NVMM last reported for this VCPU. */
++    uint64_t tsc_reported;
+ };
+ 
+ struct qemu_machine {
+@@ -181,7 +184,18 @@ nvmm_set_registers(CPUState *cpu)
+     state->msrs[NVMM_X64_MSR_SYSENTER_ESP] = env->sysenter_esp;
+     state->msrs[NVMM_X64_MSR_SYSENTER_EIP] = env->sysenter_eip;
+     state->msrs[NVMM_X64_MSR_PAT] = env->pat;
+-    state->msrs[NVMM_X64_MSR_TSC] = env->tsc;
++    /*
++     * A reset sets each VCPU's TSC to zero, one after the other, which
++     * leaves them out of step (the guest then gives up on the TSC as a
++     * clock and reads the HPET, a VM exit each time). NVMM leaves the TSC
++     * alone when it is given back what it last reported: keep the host's
++     * TSC, which is synchronized across its CPUs, on every VCPU.
++     */
++    if (env->tsc == 0) {
++        state->msrs[NVMM_X64_MSR_TSC] = qcpu->tsc_reported;
++    } else {
++        state->msrs[NVMM_X64_MSR_TSC] = env->tsc;
++    }
+ 
+     bitmap =
+         NVMM_X64_STATE_SEGS |
+@@ -337,6 +351,7 @@ nvmm_get_registers(CPUState *cpu)
+     env->sysenter_eip = state->msrs[NVMM_X64_MSR_SYSENTER_EIP];
+     env->pat = state->msrs[NVMM_X64_MSR_PAT];
+     env->tsc = state->msrs[NVMM_X64_MSR_TSC];
++    qcpu->tsc_reported = env->tsc;
+ 
+     x86_update_hflags(env);
+ }
+@@ -985,7 +1000,7 @@ nvmm_init_vcpu(CPUState *cpu)
+         }
+     }
+ 
+-    qcpu->vcpu_dirty = true;
++    cpu->vcpu_dirty = true;
+     cpu->accel = qcpu;
+ 
+     return 0;
+@@ -1175,11 +1190,11 @@ nvmm_accel_init(AccelState *as, MachineState *ms)
+     }
+     if (qemu_mach.cap.version < NVMM_KERN_VERSION) {
+         error_report("NVMM: Unsupported version %u", qemu_mach.cap.version);
+-        return -EPROGMISMATCH;
++        return -EPERM;
+     }
+     if (qemu_mach.cap.state_size != sizeof(struct nvmm_x64_state)) {
+         error_report("NVMM: Wrong state size %u", qemu_mach.cap.state_size);
+-        return -EPROGMISMATCH;
++        return -EPERM;
+     }
+ 
+     ret = nvmm_machine_create(&qemu_mach.mach);
+-- 
+2.53.0
+

@@ -1,0 +1,715 @@
+From 427b864e17d8741efd98b6114085b69bddae4a67 Mon Sep 17 00:00:00 2001
+From: Justin Gasper <jmgasper@gmail.com>
+Date: Fri, 30 Oct 2026 17:39:54 +1100
+Subject: [PATCH 3/3] 9pfs: Haiku host support
+
+virtio-9p (virtfs) on a Haiku host, as on FreeBSD and macOS:
+
+- xattrs are BFS attributes named "linux:<name>" (raw data), so they do
+  not mix with Haiku's own; files without attributes report ENOTSUP;
+- statfs from fstatvfs; device numbers in glibc's layout (Haiku's dev_t
+  has no major and minor);
+- Haiku's dirent has no d_off or d_type: readdir keeps telldir() in the
+  unused d_pino and reports DT_UNKNOWN;
+- errno values are translated to Linux's, Haiku's B_* codes included;
+- mknod makes FIFOs with mkfifoat and sockets by binding a Unix socket
+  under a short temporary name and moving it into place (bind takes a
+  path of at most 104 bytes); device nodes cannot exist on BFS;
+- no O_PATH: chmod of a special file uses fchmodat(AT_SYMLINK_NOFOLLOW),
+  and F_SETFL keeps to the flags it can change (the root file system has
+  no F_SETFL for directories at all).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fsdev/file-op-9p.h      |  16 ++
+ fsdev/meson.build       |   2 +-
+ hw/9pfs/9p-local.c      |  21 +++
+ hw/9pfs/9p-synth.c      |   2 +
+ hw/9pfs/9p-util-haiku.c | 329 ++++++++++++++++++++++++++++++++++++++++
+ hw/9pfs/9p-util.h       |  51 ++++++-
+ hw/9pfs/9p.c            |  20 ++-
+ hw/9pfs/meson.build     |   2 +
+ include/qemu/xattr.h    |   2 +
+ meson.build             |   5 +-
+ 10 files changed, 438 insertions(+), 12 deletions(-)
+ create mode 100644 hw/9pfs/9p-util-haiku.c
+
+diff --git a/fsdev/file-op-9p.h b/fsdev/file-op-9p.h
+index b85c9934d..a5ad71f1e 100644
+--- a/fsdev/file-op-9p.h
++++ b/fsdev/file-op-9p.h
+@@ -27,6 +27,22 @@
+ #  undef MACHINE /* work around some unfortunate namespace pollution */
+ # endif
+ # include <sys/mount.h>
++#elif defined(CONFIG_HAIKU)
++# include <sys/statvfs.h>
++/* Haiku has statvfs() only; 9p needs the Linux statfs fields. */
++struct statfs {
++    long f_type;
++    unsigned long f_bsize;
++    uint64_t f_blocks;
++    uint64_t f_bfree;
++    uint64_t f_bavail;
++    uint64_t f_files;
++    uint64_t f_ffree;
++    struct { int val[2]; } f_fsid;
++    long f_namelen;
++};
++int qemu_haiku_fstatfs(int fd, struct statfs *stbuf);
++# define fstatfs qemu_haiku_fstatfs
+ #endif
+ 
+ #define SM_LOCAL_MODE_BITS    0600
+diff --git a/fsdev/meson.build b/fsdev/meson.build
+index 95fe81660..57402f1ff 100644
+--- a/fsdev/meson.build
++++ b/fsdev/meson.build
+@@ -5,6 +5,6 @@ fsdev_ss.add(when: ['CONFIG_FSDEV_9P'], if_true: files(
+   '9p-marshal.c',
+   'qemu-fsdev.c',
+ ), if_false: files('qemu-fsdev-dummy.c'))
+-if host_os in ['linux', 'darwin', 'freebsd']
++if host_os in ['linux', 'darwin', 'freebsd', 'haiku']
+   system_ss.add_all(fsdev_ss)
+ endif
+diff --git a/hw/9pfs/9p-local.c b/hw/9pfs/9p-local.c
+index 31e216227..2d12526fb 100644
+--- a/hw/9pfs/9p-local.c
++++ b/hw/9pfs/9p-local.c
+@@ -357,6 +357,16 @@ static int fchmodat_nofollow(int dirfd, const char *name, mode_t mode)
+         return -1;
+     }
+ 
++#ifdef CONFIG_HAIKU
++    /*
++     * Haiku has no O_PATH, but its fchmodat() honours AT_SYMLINK_NOFOLLOW;
++     * opening would fail for a FIFO without a writer or a socket.
++     */
++    (void)fd;
++    (void)ret;
++    return fchmodat(dirfd, name, mode, AT_SYMLINK_NOFOLLOW);
++#endif
++
+     fd = openat_file(dirfd, name, O_RDONLY | O_PATH_9P_UTIL | O_NOFOLLOW, 0);
+ #if O_PATH_9P_UTIL == 0
+     /* Fallback for systems that don't support O_PATH: we depend on the file
+@@ -568,16 +578,27 @@ again:
+         return NULL;
+     }
+     entry->d_seekoff = off;
++#elif defined(CONFIG_HAIKU)
++    /* Haiku's dirent has no d_off; qemu_dirent_off() reads it from d_pino */
++    long off = telldir(fs->dir.stream);
++    if (off < 0) {
++        return NULL;
++    }
++    entry->d_pino = off;
+ #endif
+ 
+     if (ctx->export_flags & V9FS_SM_MAPPED) {
++#ifndef CONFIG_HAIKU
+         entry->d_type = DT_UNKNOWN;
++#endif
+     } else if (ctx->export_flags & V9FS_SM_MAPPED_FILE) {
+         if (local_is_mapped_file_metadata(ctx, entry->d_name)) {
+             /* skip the meta data */
+             goto again;
+         }
++#ifndef CONFIG_HAIKU
+         entry->d_type = DT_UNKNOWN;
++#endif
+     }
+ 
+     return entry;
+diff --git a/hw/9pfs/9p-synth.c b/hw/9pfs/9p-synth.c
+index b3743f616..0d5ebfa88 100644
+--- a/hw/9pfs/9p-synth.c
++++ b/hw/9pfs/9p-synth.c
+@@ -230,6 +230,8 @@ static void synth_direntry(V9fsSynthNode *node,
+     entry->d_ino = node->attr->inode;
+ #ifdef CONFIG_DARWIN
+     entry->d_seekoff = off + 1;
++#elif defined(CONFIG_HAIKU)
++    entry->d_pino = off + 1;
+ #else
+     entry->d_off = off + 1;
+ #endif
+diff --git a/hw/9pfs/9p-util-haiku.c b/hw/9pfs/9p-util-haiku.c
+new file mode 100644
+index 000000000..7af95ad9c
+--- /dev/null
++++ b/hw/9pfs/9p-util-haiku.c
+@@ -0,0 +1,329 @@
++/*
++ * 9p utilities (Haiku Implementation)
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or later.
++ * See the COPYING file in the top-level directory.
++ */
++
++/*
++ * Not so fast! You might want to read the 9p developer docs first:
++ * https://wiki.qemu.org/Documentation/9p
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/xattr.h"
++#include "fsdev/file-op-9p.h"
++#include "9p-util.h"
++
++#include <fs_attr.h>
++#include <fs_info.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <TypeConstants.h>
++
++/*
++ * Extended attributes are BFS attributes. A Linux xattr "user.foo" is the
++ * attribute "linux:user.foo", so the guest's attributes never collide with
++ * Haiku's own (BEOS:TYPE and the like), which the guest does not see.
++ */
++#define XATTR_PREFIX "linux:"
++#define XATTR_PREFIX_LEN (sizeof(XATTR_PREFIX) - 1)
++
++static char *attr_name(const char *name)
++{
++    return g_strconcat(XATTR_PREFIX, name, NULL);
++}
++
++static int open_nofollow(int dirfd, const char *filename)
++{
++    /*
++     * No O_PATH: only what opens for reading carries attributes here, so
++     * a symlink, a socket or a FIFO has none.
++     */
++    struct stat st;
++    int fd;
++
++    if (fstatat(dirfd, filename, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
++        !S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) {
++        errno = ENOTSUP;
++        return -1;
++    }
++    fd = openat_file(dirfd, filename, O_RDONLY | O_NOFOLLOW, 0);
++    if (fd == -1 && errno == ELOOP) {
++        errno = ENOTSUP;
++    }
++    return fd;
++}
++
++ssize_t fgetxattr(int fd, const char *name, void *value, size_t size)
++{
++    g_autofree char *attr = attr_name(name);
++    attr_info info;
++
++    if (fs_stat_attr(fd, attr, &info) != 0) {
++        if (errno == ENOENT || errno == B_ENTRY_NOT_FOUND || errno == -B_ENTRY_NOT_FOUND) {
++            errno = ENOATTR;
++        } else {
++            errno = ENOTSUP; /* a file system without attributes */
++        }
++        return -1;
++    }
++    if (size == 0) {
++        return info.size;
++    }
++    if ((size_t)info.size > size) {
++        errno = ERANGE;
++        return -1;
++    }
++    return fs_read_attr(fd, attr, B_RAW_TYPE, 0, value, info.size);
++}
++
++ssize_t fgetxattrat_nofollow(int dirfd, const char *filename, const char *name,
++                             void *value, size_t size)
++{
++    ssize_t ret;
++    int fd = open_nofollow(dirfd, filename);
++
++    if (fd == -1) {
++        return -1;
++    }
++    ret = fgetxattr(fd, name, value, size);
++    close_preserve_errno(fd);
++    return ret;
++}
++
++ssize_t flistxattrat_nofollow(int dirfd, const char *filename,
++                              char *list, size_t size)
++{
++    ssize_t total = 0;
++    struct dirent *de;
++    DIR *dir;
++    int fd = open_nofollow(dirfd, filename);
++
++    if (fd == -1) {
++        return -1;
++    }
++    dir = fs_fopen_attr_dir(fd);
++    if (!dir) {
++        /* no attributes on this file system: an empty list */
++        close(fd);
++        return 0;
++    }
++    while ((de = fs_read_attr_dir(dir)) != NULL) {
++        size_t len;
++
++        if (strncmp(de->d_name, XATTR_PREFIX, XATTR_PREFIX_LEN) != 0) {
++            continue;
++        }
++        len = strlen(de->d_name + XATTR_PREFIX_LEN) + 1;
++        if (size != 0) {
++            if (total + len > size) {
++                fs_close_attr_dir(dir);
++                close(fd);
++                errno = ERANGE;
++                return -1;
++            }
++            memcpy(list + total, de->d_name + XATTR_PREFIX_LEN, len);
++        }
++        total += len;
++    }
++    fs_close_attr_dir(dir);
++    close(fd);
++    return total;
++}
++
++ssize_t fremovexattrat_nofollow(int dirfd, const char *filename,
++                                const char *name)
++{
++    g_autofree char *attr = attr_name(name);
++    int ret, fd = open_nofollow(dirfd, filename);
++
++    if (fd == -1) {
++        return -1;
++    }
++    ret = fs_remove_attr(fd, attr);
++    if (ret != 0 && (errno == ENOENT || errno == B_ENTRY_NOT_FOUND)) {
++        errno = ENOATTR;
++    }
++    close_preserve_errno(fd);
++    return ret;
++}
++
++int fsetxattrat_nofollow(int dirfd, const char *filename, const char *name,
++                         void *value, size_t size, int flags)
++{
++    g_autofree char *attr = attr_name(name);
++    attr_info info;
++    ssize_t ret;
++    int fd;
++
++    if (flags == (XATTR_CREATE | XATTR_REPLACE)) {
++        errno = EINVAL;
++        return -1;
++    }
++    fd = open_nofollow(dirfd, filename);
++    if (fd == -1) {
++        return -1;
++    }
++    if (flags & (XATTR_CREATE | XATTR_REPLACE)) {
++        bool exists = fs_stat_attr(fd, attr, &info) == 0;
++
++        if (exists && (flags & XATTR_CREATE)) {
++            close(fd);
++            errno = EEXIST;
++            return -1;
++        }
++        if (!exists && (flags & XATTR_REPLACE)) {
++            close(fd);
++            errno = ENOATTR;
++            return -1;
++        }
++    }
++    /* fs_write_attr() keeps a longer old value's tail: replace it whole */
++    fs_remove_attr(fd, attr);
++    ret = fs_write_attr(fd, attr, B_RAW_TYPE, 0, value, size);
++    close_preserve_errno(fd);
++    return ret < 0 ? -1 : 0;
++}
++
++/*
++ * Haiku's mknodat() makes FIFOs only. A socket node is what binding a Unix
++ * domain socket leaves behind, so bind one under a short temporary name (on
++ * the same volume) and move it into place. Device nodes cannot exist on BFS.
++ */
++static int mksocketat(int dirfd, const char *filename, mode_t mode)
++{
++    struct sockaddr_un addr = { .sun_family = AF_UNIX };
++    g_autofree char *tmpdir = NULL;
++    int sock, ret, serrno;
++
++    tmpdir = g_dir_make_tmp("qemu-9p-XXXXXX", NULL);
++    if (!tmpdir) {
++        errno = EIO;
++        return -1;
++    }
++    if (snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/s", tmpdir) >=
++        sizeof(addr.sun_path)) {
++        rmdir(tmpdir);
++        errno = ENAMETOOLONG;
++        return -1;
++    }
++    sock = socket(AF_UNIX, SOCK_STREAM, 0);
++    if (sock == -1) {
++        serrno = errno;
++        rmdir(tmpdir);
++        errno = serrno;
++        return -1;
++    }
++    ret = bind(sock, (struct sockaddr *)&addr, sizeof(addr));
++    serrno = errno;
++    close(sock);
++    if (ret == 0) {
++        ret = renameat(AT_FDCWD, addr.sun_path, dirfd, filename);
++        serrno = errno;
++        if (ret == 0) {
++            fchmodat(dirfd, filename, mode & 07777, AT_SYMLINK_NOFOLLOW);
++        } else {
++            unlink(addr.sun_path);
++        }
++    }
++    rmdir(tmpdir);
++    errno = serrno;
++    return ret;
++}
++
++int qemu_mknodat(int dirfd, const char *filename, mode_t mode, dev_t dev)
++{
++    if (S_ISSOCK(mode)) {
++        return mksocketat(dirfd, filename, mode);
++    }
++    if (S_ISFIFO(mode)) {
++        return mkfifoat(dirfd, filename, mode & 07777);
++    }
++    if (S_ISREG(mode)) {
++        int fd = openat(dirfd, filename, O_CREAT | O_EXCL | O_WRONLY,
++                        mode & 07777);
++        if (fd == -1) {
++            return -1;
++        }
++        close(fd);
++        return 0;
++    }
++    errno = EPERM;
++    return -1;
++}
++
++int qemu_haiku_fstatfs(int fd, struct statfs *stbuf)
++{
++    struct statvfs vfs;
++    struct stat st;
++
++    if (fstatvfs(fd, &vfs) != 0 || fstat(fd, &st) != 0) {
++        return -1;
++    }
++    memset(stbuf, 0, sizeof(*stbuf));
++    stbuf->f_type = 0x42465331; /* "BFS1", BFS's own magic */
++    stbuf->f_bsize = vfs.f_bsize;
++    stbuf->f_blocks = vfs.f_blocks * vfs.f_frsize / vfs.f_bsize;
++    stbuf->f_bfree = vfs.f_bfree * vfs.f_frsize / vfs.f_bsize;
++    stbuf->f_bavail = vfs.f_bavail * vfs.f_frsize / vfs.f_bsize;
++    stbuf->f_files = vfs.f_files;
++    stbuf->f_ffree = vfs.f_ffree;
++    stbuf->f_fsid.val[0] = st.st_dev;
++    stbuf->f_namelen = vfs.f_namemax;
++    return 0;
++}
++
++int haiku_errno_to_linux(int err)
++{
++    static const struct { int haiku, linux; } map[] = {
++        { EPERM, 1 }, { ENOENT, 2 }, { ESRCH, 3 }, { EINTR, 4 }, { EIO, 5 },
++        { ENXIO, 6 }, { E2BIG, 7 }, { ENOEXEC, 8 }, { EBADF, 9 },
++        { ECHILD, 10 }, { EAGAIN, 11 }, { ENOMEM, 12 }, { EACCES, 13 },
++        { EFAULT, 14 }, { EBUSY, 16 }, { EEXIST, 17 }, { EXDEV, 18 },
++        { ENODEV, 19 }, { ENOTDIR, 20 }, { EISDIR, 21 }, { EINVAL, 22 },
++        { ENFILE, 23 }, { EMFILE, 24 }, { ENOTTY, 25 }, { ETXTBSY, 26 },
++        { EFBIG, 27 }, { ENOSPC, 28 }, { ESPIPE, 29 }, { EROFS, 30 },
++        { EMLINK, 31 }, { EPIPE, 32 }, { EDOM, 33 }, { ERANGE, 34 },
++        { EDEADLK, 35 }, { ENAMETOOLONG, 36 }, { ENOLCK, 37 }, { ENOSYS, 38 },
++        { ENOTEMPTY, 39 }, { ELOOP, 40 }, { ENOMSG, 42 }, { EIDRM, 43 },
++        { ENOSTR, 60 }, { ENODATA, 61 }, { ENOATTR, 61 }, { ETIME, 62 },
++        { ENOLINK, 67 }, { EPROTO, 71 }, { EMULTIHOP, 72 }, { EBADMSG, 74 },
++        { EOVERFLOW, 75 }, { EILSEQ, 84 }, { ENOTSOCK, 88 },
++        { EDESTADDRREQ, 89 }, { EMSGSIZE, 90 }, { EPROTOTYPE, 91 },
++        { ENOPROTOOPT, 92 }, { EPROTONOSUPPORT, 93 }, { ENOTSUP, 95 },
++        { EOPNOTSUPP, 95 }, { EAFNOSUPPORT, 97 }, { EADDRINUSE, 98 },
++        { EADDRNOTAVAIL, 99 }, { ENETDOWN, 100 }, { ENETUNREACH, 101 },
++        { ENETRESET, 102 }, { ECONNABORTED, 103 }, { ECONNRESET, 104 },
++        { ENOBUFS, 105 }, { EISCONN, 106 }, { ENOTCONN, 107 },
++        { ETIMEDOUT, 110 }, { ECONNREFUSED, 111 }, { EHOSTUNREACH, 113 },
++        { EALREADY, 114 }, { EINPROGRESS, 115 }, { ESTALE, 116 },
++        { EDQUOT, 122 }, { ECANCELED, 125 },
++    };
++    size_t i;
++
++    for (i = 0; i < ARRAY_SIZE(map); i++) {
++        if (map[i].haiku == err) {
++            return map[i].linux;
++        }
++    }
++    /* Haiku's own codes, which some calls report as they are */
++    static const struct { status_t haiku; int linux; } bmap[] = {
++        { B_ENTRY_NOT_FOUND, 2 }, { B_NOT_ALLOWED, 1 },
++        { B_PERMISSION_DENIED, 13 }, { B_BAD_VALUE, 22 },
++        { B_NOT_SUPPORTED, 95 }, { B_UNSUPPORTED, 95 }, { B_NO_MEMORY, 12 },
++        { B_FILE_ERROR, 9 }, { B_FILE_EXISTS, 17 }, { B_NAME_IN_USE, 17 },
++        { B_BUSY, 16 }, { B_READ_ONLY_DEVICE, 30 }, { B_NOT_A_DIRECTORY, 20 },
++        { B_IS_A_DIRECTORY, 21 }, { B_DIRECTORY_NOT_EMPTY, 39 },
++        { B_LINK_LIMIT, 40 }, { B_NAME_TOO_LONG, 36 }, { B_DEVICE_FULL, 28 },
++        { B_CROSS_DEVICE_LINK, 18 }, { B_TIMED_OUT, 110 },
++        { B_INTERRUPTED, 4 }, { B_WOULD_BLOCK, 11 }, { B_BAD_TYPE, 22 },
++        { B_BAD_INDEX, 22 }, { B_DEVICE_NOT_FOUND, 19 },
++    };
++    for (i = 0; i < ARRAY_SIZE(bmap); i++) {
++        if (bmap[i].haiku == err || -bmap[i].haiku == err) {
++            return bmap[i].linux;
++        }
++    }
++    return 5; /* EIO */
++}
+diff --git a/hw/9pfs/9p-util.h b/hw/9pfs/9p-util.h
+index 8dfa803dc..7c9f6f62c 100644
+--- a/hw/9pfs/9p-util.h
++++ b/hw/9pfs/9p-util.h
+@@ -21,15 +21,23 @@
+ #define O_PATH_9P_UTIL 0
+ #endif
+ 
+-#ifdef CONFIG_FREEBSD
++#if defined(CONFIG_FREEBSD) || defined(CONFIG_HAIKU)
+ /*
+- * FreeBSD does not have these flags, so we can only emulate their intended
++ * FreeBSD (and Haiku) does not have these flags, so we can only emulate their intended
+  * behaviour (racily).
+  */
+ #define XATTR_CREATE    0x1
+ #define XATTR_REPLACE   0x2
+ #endif
+ 
++#ifdef CONFIG_HAIKU
++/* Haiku's dev_t has no major and minor parts; use the glibc layout. */
++#define major(dev) ((unsigned int)(((dev) >> 8) & 0xfff))
++#define minor(dev) ((unsigned int)(((dev) & 0xff) | (((dev) >> 12) & 0xfff00)))
++#define makedev(ma, mi) ((dev_t)((((ma) & 0xfff) << 8) | ((mi) & 0xff) | \
++                                 (((mi) & 0xfff00) << 12)))
++#endif
++
+ #if !defined(CONFIG_LINUX)
+ 
+ /*
+@@ -69,6 +77,10 @@ static inline uint64_t host_dev_to_dotl_dev(dev_t dev)
+ #endif
+ }
+ 
++#ifdef CONFIG_HAIKU
++int haiku_errno_to_linux(int err);
++#endif
++
+ /* Translates errno from host -> Linux if needed */
+ static inline int errno_to_dotl(int err) {
+ #if defined(CONFIG_LINUX)
+@@ -93,6 +105,9 @@ static inline int errno_to_dotl(int err) {
+     } else if (err == EOPNOTSUPP) {
+         err = 95; /* ==EOPNOTSUPP on Linux */
+     }
++#elif defined(CONFIG_HAIKU)
++    /* Haiku's errno values have nothing in common with Linux's. */
++    err = haiku_errno_to_linux(err);
+ #else
+ #error Missing errno translation to Linux for this host system
+ #endif
+@@ -164,13 +179,13 @@ static inline int openat_file(int dirfd, const char *name, int flags,
+ {
+     int fd, serrno, ret;
+ 
+-#if !defined(CONFIG_DARWIN) && !defined(CONFIG_FREEBSD)
++#if !defined(CONFIG_DARWIN) && !defined(CONFIG_FREEBSD) && !defined(CONFIG_HAIKU)
+ again:
+ #endif
+     fd = qemu_openat(dirfd, name, flags | O_NOFOLLOW | O_NOCTTY | O_NONBLOCK,
+                      mode);
+     if (fd == -1) {
+-#if !defined(CONFIG_DARWIN) && !defined(CONFIG_FREEBSD)
++#if !defined(CONFIG_DARWIN) && !defined(CONFIG_FREEBSD) && !defined(CONFIG_HAIKU)
+         if (errno == EPERM && (flags & O_NOATIME)) {
+             /*
+              * The client passed O_NOATIME but we lack permissions to honor it.
+@@ -204,14 +219,29 @@ again:
+          * do that with O_PATH since fcntl(F_SETFL) isn't supported, and
+          * openat() ignored it anyway.
+          */
++#ifdef CONFIG_HAIKU
++        /*
++         * Haiku refuses flags F_SETFL cannot change (Linux ignores them),
++         * and its root file system has no F_SETFL at all: a directory
++         * there stays non-blocking, which no directory operation minds.
++         */
++        ret = fcntl(fd, F_SETFL, flags & (O_APPEND | O_NONBLOCK));
++        if (ret == -1) {
++            struct stat st;
++            if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
++                ret = 0;
++            }
++        }
++#else
+         ret = fcntl(fd, F_SETFL, flags);
++#endif
+         assert(!ret);
+         errno = serrno;
+     }
+     return fd;
+ }
+ 
+-#ifdef CONFIG_FREEBSD
++#if defined(CONFIG_FREEBSD) || defined(CONFIG_HAIKU)
+ ssize_t fgetxattr(int dirfd, const char *name, void *value, size_t size);
+ #endif
+ ssize_t fgetxattrat_nofollow(int dirfd, const char *path, const char *name,
+@@ -233,11 +263,22 @@ static inline off_t qemu_dirent_off(struct dirent *dent)
+ {
+ #ifdef CONFIG_DARWIN
+     return dent->d_seekoff;
++#elif defined(CONFIG_HAIKU)
++    /* no d_off: local_readdir() keeps telldir() in the unused d_pino */
++    return dent->d_pino;
+ #else
+     return dent->d_off;
+ #endif
+ }
+ 
++/* Haiku's dirent has no d_type; the guest stats what it needs. */
++#ifdef CONFIG_HAIKU
++#define DT_UNKNOWN 0
++#define qemu_dirent_type(dent) DT_UNKNOWN
++#else
++#define qemu_dirent_type(dent) ((dent)->d_type)
++#endif
++
+ /**
+  * qemu_dirent_dup() - Duplicate directory entry @dent.
+  *
+diff --git a/hw/9pfs/9p.c b/hw/9pfs/9p.c
+index bc4a016ee..005528521 100644
+--- a/hw/9pfs/9p.c
++++ b/hw/9pfs/9p.c
+@@ -135,8 +135,10 @@ static int dotl_to_open_flags(int flags)
+         { P9_DOTL_APPEND, O_APPEND },
+         { P9_DOTL_NONBLOCK, O_NONBLOCK } ,
+         { P9_DOTL_DSYNC, O_DSYNC },
++#ifndef CONFIG_HAIKU
+         { P9_DOTL_FASYNC, FASYNC },
+-#if !defined(CONFIG_DARWIN) && !defined(CONFIG_FREEBSD)
++#endif
++#if !defined(CONFIG_DARWIN) && !defined(CONFIG_FREEBSD) && !defined(CONFIG_HAIKU)
+         { P9_DOTL_NOATIME, O_NOATIME },
+ #endif
+ #ifndef CONFIG_DARWIN
+@@ -149,7 +151,9 @@ static int dotl_to_open_flags(int flags)
+          */
+         { P9_DOTL_DIRECT, O_DIRECT },
+ #endif
++#ifndef CONFIG_HAIKU
+         { P9_DOTL_LARGEFILE, O_LARGEFILE },
++#endif
+         { P9_DOTL_DIRECTORY, O_DIRECTORY },
+         { P9_DOTL_NOFOLLOW, O_NOFOLLOW },
+         { P9_DOTL_SYNC, O_SYNC },
+@@ -179,7 +183,11 @@ static int get_dotl_openflags(V9fsState *s, int oflags)
+      * Filter the client open flags
+      */
+     flags = dotl_to_open_flags(oflags);
++#ifdef CONFIG_HAIKU
++    flags &= ~(O_NOCTTY | O_CREAT);
++#else
+     flags &= ~(O_NOCTTY | O_ASYNC | O_CREAT);
++#endif
+ #ifndef CONFIG_DARWIN
+     /*
+      * Ignore direct disk access hint until the server supports it.
+@@ -2609,7 +2617,7 @@ static int coroutine_fn v9fs_do_readdir(V9fsPDU *pdu, V9fsFidState *fidp,
+         /* 11 = 7 + 4 (7 = start offset, 4 = space for storing count) */
+         len = pdu_marshal(pdu, 11 + count, "Qqbs",
+                           &qid, off,
+-                          dent->d_type, &name);
++                          qemu_dirent_type(dent), &name);
+ 
+         v9fs_string_free(&name);
+ 
+@@ -3664,6 +3672,10 @@ static int v9fs_fill_statfs(V9fsState *s, V9fsPDU *pdu, struct statfs *stbuf)
+     fsid_val = (unsigned int)stbuf->f_fsid.val[0] |
+                (unsigned long long)stbuf->f_fsid.val[1] << 32;
+     f_namelen = NAME_MAX;
++#elif defined(CONFIG_HAIKU)
++    fsid_val = (unsigned int)stbuf->f_fsid.val[0] |
++               (unsigned long long)stbuf->f_fsid.val[1] << 32;
++    f_namelen = NAME_MAX;
+ #else
+     fsid_val = (unsigned int) stbuf->f_fsid.__val[0] |
+                (unsigned long long)stbuf->f_fsid.__val[1] << 32;
+@@ -4052,9 +4064,9 @@ out_nofid:
+  * Linux guests.
+  */
+ #define P9_XATTR_SIZE_MAX 65536
+-#elif defined(CONFIG_FREEBSD)
++#elif defined(CONFIG_FREEBSD) || defined(CONFIG_HAIKU)
+ /*
+- * FreeBSD similarly doesn't define a maximum xattr size, the limit is
++ * FreeBSD (and Haiku's BFS) similarly doesn't define a maximum xattr size, the limit is
+  * filesystem dependent.  On UFS filesystems it's 2 times the filesystem block
+  * size, typically 32KB.  On ZFS it depends on the value of the xattr property;
+  * with the default value there is no limit, and with xattr=sa it is 64KB.
+diff --git a/hw/9pfs/meson.build b/hw/9pfs/meson.build
+index 7f4d6e3a4..9492ac663 100644
+--- a/hw/9pfs/meson.build
++++ b/hw/9pfs/meson.build
+@@ -17,6 +17,8 @@ if host_os == 'darwin'
+   fs_ss.add(files('9p-util-darwin.c'))
+ elif host_os == 'freebsd'
+   fs_ss.add(files('9p-util-freebsd.c'))
++elif host_os == 'haiku'
++  fs_ss.add(files('9p-util-haiku.c'))
+ elif host_os == 'linux'
+   fs_ss.add(files('9p-util-linux.c'))
+ endif
+diff --git a/include/qemu/xattr.h b/include/qemu/xattr.h
+index 224ba1276..48d3ef6bc 100644
+--- a/include/qemu/xattr.h
++++ b/include/qemu/xattr.h
+@@ -28,6 +28,8 @@
+ #  ifndef CONFIG_WIN32
+ #    ifdef CONFIG_FREEBSD
+ #      include <sys/extattr.h>
++#    elif defined(CONFIG_HAIKU)
++       /* BFS attributes, hw/9pfs/9p-util-haiku.c */
+ #    else
+ #      include <sys/xattr.h>
+ #    endif
+diff --git a/meson.build b/meson.build
+index 64796c9f9..2d1873acf 100644
+--- a/meson.build
++++ b/meson.build
+@@ -2353,8 +2353,8 @@ dbus_display = get_option('dbus_display') \
+   .allowed()
+ 
+ have_virtfs = get_option('virtfs') \
+-    .require(host_os == 'linux' or host_os == 'darwin' or host_os == 'freebsd',
+-             error_message: 'virtio-9p (virtfs) requires Linux or macOS or FreeBSD') \
++    .require(host_os == 'linux' or host_os == 'darwin' or host_os == 'freebsd' or host_os == 'haiku',
++             error_message: 'virtio-9p (virtfs) requires Linux or macOS or FreeBSD or Haiku') \
+     .require(host_os != 'darwin' or cc.has_function('pthread_fchdir_np'),
+              error_message: 'virtio-9p (virtfs) on macOS requires the presence of pthread_fchdir_np') \
+     .require(host_os != 'linux' or libattr.found(),
+@@ -2455,6 +2455,7 @@ config_host_data.set('CONFIG_FREEBSD', host_os == 'freebsd')
+ config_host_data.set('CONFIG_CAPSTONE', capstone.found())
+ config_host_data.set('CONFIG_COCOA', cocoa.found())
+ config_host_data.set('CONFIG_DARWIN', host_os == 'darwin')
++config_host_data.set('CONFIG_HAIKU', host_os == 'haiku')
+ config_host_data.set('CONFIG_FDT', fdt.found())
+ config_host_data.set('CONFIG_FUZZ', get_option('fuzzing'))
+ config_host_data.set('CONFIG_GCOV', get_option('b_coverage'))
+-- 
+2.53.0
+
