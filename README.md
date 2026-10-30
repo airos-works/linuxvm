@@ -85,9 +85,14 @@ for the VM's memory and processors.
   request is a round trip to it. Starting a process from a 9p root file
   system takes about 10 ms (about 4 ms under KVM). `fsync` costs what it
   costs on BFS (about 11 ms on an NVMe drive) plus the round trip.
-- **arm64.** The VM needs QEMU for air/OS arm64, whose libraries (GLib,
-  libslirp) are not built for arm64 yet, and Haiku has no hypervisor on arm64,
-  so it would run under TCG emulation.
+- **arm64** runs the VM under emulation (TCG): Haiku has no hypervisor on
+  arm64. The package carries QEMU's own GLib and libslirp (built from
+  source with HaikuPorts' patches; arm64 has no HaikuPorts repository) in
+  `lib/linuxvm/lib`, and the guest is an ARMv8.2 core (`neoverse-n1`), which
+  spares the guest kernel SVE and SME state on every context switch. It
+  works, but expect code in containers to run several times slower than on
+  the host. Verified so far in an emulated arm64 air/OS (QEMU's code
+  generator works on Haiku arm64 and boots the VM); not yet on a board.
 - **BFS** has no hard links (extraction copies the file) and no device nodes.
 - `docker cp` into a running container may not show in it until the page
   cache drops the file; files a running container writes reach BFS within
