@@ -70,8 +70,12 @@ docker run alpine ──▶ dockerd ──▶ containerd ──▶ containerd-sh
 `--privileged`, `--cap-add/--cap-drop`, `--memory`, `--cpus`, `--pids-limit`,
 `--read-only`, `--sysctl`, `--ulimit`; `docker exec` (with `-u` and `-t`),
 `logs`, `stop` (with the image's stop signal), `kill -s`, `top`, `stats`,
-`pause`/`unpause`, `update`; `docker compose` stacks. Unix sockets and FIFOs
-work on 9p (PostgreSQL's socket, for one).
+`pause`/`unpause`, `update`; `docker build` (the classic builder: `FROM` a
+Linux image, `RUN`, `COPY`, `USER`...), `commit`, `save`; `docker compose`
+stacks. Unix sockets and FIFOs work on 9p (PostgreSQL's socket, for one).
+`containerd-linuxvm status` and `containerd-linuxvm stop` ask the running
+supervisor; Docker Desktop's settings have a Linux VM tab for the same and
+for the VM's memory and processors.
 
 ## Limits
 
