@@ -12,7 +12,13 @@ trap 'rm -rf -- "$STAGE"' EXIT
 mkdir -p "$STAGE/lib/linuxvm" "$STAGE/data/linuxvm/firmware" "$STAGE/documentation/packages/linuxvm" "$ROOT/artifacts"
 cp "$BUILD/qemu-system-$QEMU_TARGET" "$STAGE/lib/linuxvm/"
 cp "$BUILD/vmlinuz" "$BUILD/initramfs.img" "$STAGE/data/linuxvm/"
-cp "$BUILD"/firmware/* "$STAGE/data/linuxvm/firmware/"
+# x86_64 boots with SeaBIOS; arm64's virt machine needs no firmware but
+# brings QEMU's own GLib and libslirp (lib/linuxvm/lib, its RPATH)
+[[ ! -d $BUILD/firmware ]] || cp "$BUILD"/firmware/* "$STAGE/data/linuxvm/firmware/"
+if [[ -d $BUILD/lib ]]; then
+	mkdir -p "$STAGE/lib/linuxvm/lib"
+	cp "$BUILD"/lib/* "$STAGE/lib/linuxvm/lib/"
+fi
 cp "$ROOT/README.md" "$STAGE/documentation/packages/linuxvm/"
 cat > "$STAGE/.PackageInfo" <<PKGEOF
 name linuxvm
@@ -34,6 +40,8 @@ requires {
     lib:libz
 }
 PKGEOF
+# arm64's QEMU carries its own GLib and libslirp
+[[ $ARCH == x86_64 ]] || sed -i '/lib:libglib_2.0/d; /lib:libslirp/d' "$STAGE/.PackageInfo"
 out="$ROOT/artifacts/linuxvm-$VERSION-1-$ARCH.hpkg"
 rm -f "$out"
 "$PACKAGE_TOOL" create -C "$STAGE" "$out"
