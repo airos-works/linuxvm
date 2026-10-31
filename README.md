@@ -89,10 +89,13 @@ for the VM's memory and processors.
   arm64. The package carries QEMU's own GLib and libslirp (built from
   source with HaikuPorts' patches; arm64 has no HaikuPorts repository) in
   `lib/linuxvm/lib`, and the guest is an ARMv8.2 core (`neoverse-n1`), which
-  spares the guest kernel SVE and SME state on every context switch. It
-  works, but expect code in containers to run several times slower than on
-  the host. Verified so far in an emulated arm64 air/OS (QEMU's code
-  generator works on Haiku arm64 and boots the VM); not yet on a board.
+  spares the guest kernel SVE and SME state on every context switch; it
+  boots without KPTI, which under TCG flushes QEMU's TLB on every system
+  call. On a Raspberry Pi 4 the VM boots in about 15 seconds and a
+  container starts in about 30, but code in containers runs dozens of times
+  slower than on the host (a system call about 33 µs, a shell loop about
+  80 times slower than natively): good for trying an image or running a
+  small service, not for builds or heavy work.
 - **BFS** has no hard links (extraction copies the file) and no device nodes.
 - `docker cp` into a running container may not show in it until the page
   cache drops the file; files a running container writes reach BFS within
