@@ -93,8 +93,8 @@ for the VM's memory and processors.
   boots without KPTI, which under TCG flushes QEMU's TLB on every system
   call. On a Raspberry Pi 4 the VM boots in about 15 seconds and a
   container starts in about 30, but code in containers runs dozens of times
-  slower than on the host (a system call about 33 µs, a shell loop about
-  80 times slower than natively): good for trying an image or running a
+  slower than on the host (a system call about 33 µs; hashing about 50
+  times slower than natively): good for trying an image or running a
   small service, not for builds or heavy work.
 - **BFS** has no hard links (extraction copies the file) and no device nodes.
 - `docker cp` into a running container may not show in it until the page
